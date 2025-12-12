@@ -2,11 +2,11 @@
 
 namespace UmutcanGungormus\NamedRouteBinding;
 
-use Illuminate\Container\Container;
 use Illuminate\Routing\ControllerDispatcher;
 use Illuminate\Routing\Route;
 use ReflectionMethod;
 use ReflectionParameter;
+use ReflectionNamedType;
 
 class NamedControllerDispatcher extends ControllerDispatcher
 {
@@ -20,35 +20,101 @@ class NamedControllerDispatcher extends ControllerDispatcher
      */
     public function dispatch(Route $route, $controller, $method)
     {
+        // If disabled, use default Laravel behavior
         if (!config('named-route-binding.enabled', true)) {
             return parent::dispatch($route, $controller, $method);
         }
 
-        $parameters = $this->resolveNamedParameters($route, $controller, $method);
+        // Reorder route parameters to match method parameter names
+        $this->reorderRouteParameters($route, $controller, $method);
+
+        // Use Laravel's built-in dependency resolution
+        $parameters = $this->resolveClassMethodDependencies(
+            $route->parametersWithoutNulls(),
+            $controller,
+            $method
+        );
 
         return $controller->{$method}(...array_values($parameters));
     }
 
     /**
-     * Resolve parameters by matching route parameter names to method parameter names.
+     * Reorder route parameters to match the controller method's parameter order.
      *
      * @param  \Illuminate\Routing\Route  $route
      * @param  mixed  $controller
      * @param  string  $method
-     * @return array
+     * @return void
      */
-    protected function resolveNamedParameters(Route $route, $controller, string $method): array
+    protected function reorderRouteParameters(Route $route, $controller, string $method): void
     {
         $routeParameters = $route->parameters();
-        $methodParameters = $this->getMethodParameters($controller, $method);
-
-        $resolved = [];
-
-        foreach ($methodParameters as $parameter) {
-            $resolved[] = $this->resolveParameter($parameter, $routeParameters, $route);
+        
+        if (empty($routeParameters)) {
+            return;
         }
 
-        return $resolved;
+        $methodParameters = $this->getMethodParameters($controller, $method);
+        $reorderedParameters = [];
+        $usedRouteParams = [];
+
+        // First pass: match by name
+        foreach ($methodParameters as $methodParam) {
+            $paramName = $methodParam->getName();
+            $matchedValue = $this->findMatchingRouteParameter($paramName, $routeParameters);
+            
+            if ($matchedValue !== null) {
+                $reorderedParameters[$paramName] = $matchedValue['value'];
+                $usedRouteParams[] = $matchedValue['key'];
+            }
+        }
+
+        // Replace route parameters with reordered ones
+        // First, forget all existing parameters
+        foreach (array_keys($routeParameters) as $key) {
+            $route->forgetParameter($key);
+        }
+
+        // Then set the reordered parameters
+        foreach ($reorderedParameters as $key => $value) {
+            $route->setParameter($key, $value);
+        }
+
+        // Add any remaining route parameters that weren't matched
+        foreach ($routeParameters as $key => $value) {
+            if (!in_array($key, $usedRouteParams) && !array_key_exists($key, $reorderedParameters)) {
+                $route->setParameter($key, $value);
+            }
+        }
+    }
+
+    /**
+     * Find a matching route parameter for the given method parameter name.
+     *
+     * @param  string  $paramName
+     * @param  array  $routeParameters
+     * @return array|null
+     */
+    protected function findMatchingRouteParameter(string $paramName, array $routeParameters): ?array
+    {
+        // 1. Exact match
+        if (array_key_exists($paramName, $routeParameters)) {
+            return ['key' => $paramName, 'value' => $routeParameters[$paramName]];
+        }
+
+        // 2. Try snake_case version
+        $snakeCaseName = $this->toSnakeCase($paramName);
+        if (array_key_exists($snakeCaseName, $routeParameters)) {
+            return ['key' => $snakeCaseName, 'value' => $routeParameters[$snakeCaseName]];
+        }
+
+        // 3. Try camelCase version
+        $camelCaseName = $this->toCamelCase($paramName);
+        if (array_key_exists($camelCaseName, $routeParameters)) {
+            return ['key' => $camelCaseName, 'value' => $routeParameters[$camelCaseName]];
+        }
+
+        return null;
     }
 
     /**
@@ -63,71 +129,6 @@ class NamedControllerDispatcher extends ControllerDispatcher
         $reflection = new ReflectionMethod($controller, $method);
         
         return $reflection->getParameters();
-    }
-
-    /**
-     * Resolve a single parameter.
-     *
-     * @param  ReflectionParameter  $parameter
-     * @param  array  $routeParameters
-     * @param  \Illuminate\Routing\Route  $route
-     * @return mixed
-     */
-    protected function resolveParameter(ReflectionParameter $parameter, array $routeParameters, Route $route): mixed
-    {
-        $parameterName = $parameter->getName();
-        $parameterType = $parameter->getType();
-
-        // 1. Look for exact name match in route parameters
-        if (array_key_exists($parameterName, $routeParameters)) {
-            return $routeParameters[$parameterName];
-        }
-
-        // 2. Try snake_case / camelCase conversion
-        $snakeCaseName = $this->toSnakeCase($parameterName);
-        if (array_key_exists($snakeCaseName, $routeParameters)) {
-            return $routeParameters[$snakeCaseName];
-        }
-
-        $camelCaseName = $this->toCamelCase($parameterName);
-        if (array_key_exists($camelCaseName, $routeParameters)) {
-            return $routeParameters[$camelCaseName];
-        }
-
-        // 3. If type-hinted class, resolve from container
-        if ($parameterType && !$parameterType->isBuiltin()) {
-            $typeName = $parameterType->getName();
-            
-            // Check if it's a Request class
-            if (is_subclass_of($typeName, \Illuminate\Http\Request::class) || $typeName === \Illuminate\Http\Request::class) {
-                return $this->container->make(\Illuminate\Http\Request::class);
-            }
-
-            // Resolve other dependencies from container
-            if ($this->container->bound($typeName) || class_exists($typeName)) {
-                try {
-                    return $this->container->make($typeName);
-                } catch (\Exception $e) {
-                    // If container can't resolve, fall back to default value
-                }
-            }
-        }
-
-        // 4. Use default value if available
-        if ($parameter->isDefaultValueAvailable()) {
-            return $parameter->getDefaultValue();
-        }
-
-        // 5. Return null if nullable
-        if ($parameter->allowsNull()) {
-            return null;
-        }
-
-        // 6. If none of the above, throw exception
-        throw new \InvalidArgumentException(
-            "Unable to resolve parameter [{$parameterName}] for controller method. " .
-            "Available route parameters: " . implode(', ', array_keys($routeParameters))
-        );
     }
 
     /**
@@ -152,4 +153,3 @@ class NamedControllerDispatcher extends ControllerDispatcher
         return lcfirst(str_replace(' ', '', ucwords(str_replace(['_', '-'], ' ', $value))));
     }
 }
-
